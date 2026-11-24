@@ -1,0 +1,175 @@
+//
+//  WiFiJoiner.swift
+//  TripperDashPP
+//
+//  Joins the phone to a Tripper's Wi-Fi AP from inside the app, so the rider
+//  doesn't have to leave for iOS Settings. Wraps NEHotspotConfigurationManager
+//  (NetworkExtension).
+//
+//  ENTITLEMENT: this requires `com.apple.developer.networking.HotspotConfiguration`,
+//  which is a PAID Apple Developer Program capability; because of it a free
+//  Personal Team can't sign the app at all — see CLAUDE.md.
+//
+//  Tripper APs all use the same fixed passphrase ("12345678", WPA2) and the
+//  same gateway (192.168.1.1). We register the network (persisted, not
+//  join-once) so iOS keeps auto-joining it on later rides, and we can also
+//  force a join on demand right before connecting to the dash.
+//
+
+import Foundation
+import NetworkExtension
+import os
+
+/// Result of a join attempt, so callers can tell "already there" from "just
+/// joined" from a real failure.
+enum WiFiJoinOutcome: Sendable, Equatable {
+    case alreadyJoined      // phone was already on this SSID
+    case joined             // we successfully joined it
+    case failed(String)     // join failed (reason for logging/UI)
+}
+
+/// Thin async wrapper over NEHotspotConfigurationManager. All Tripper APs share
+/// one WPA2 passphrase, so callers only pass the SSID.
+@MainActor
+final class WiFiJoiner {
+
+    /// The fixed passphrase every Tripper AP ships with.
+    static let tripperPassphrase = "12345678"
+
+    private let log = Logger(subsystem: "eu.kolaczek.tripperdashpp", category: "WiFiJoiner")
+
+    /// Register a Tripper network with iOS so it's known and auto-joined on
+    /// future rides. Persisted (joinOnce = false). Applying a configuration
+    /// for an SSID that's already registered is a harmless no-op refresh.
+    ///
+    /// Called when the rider adds a bike, so the network is set up ahead of
+    /// the first connect — exactly the "save the Wi-Fi too" behaviour.
+    @discardableResult
+    func register(ssid: String) async -> WiFiJoinOutcome {
+        await apply(ssid: ssid)
+    }
+
+    /// Ensure the phone is on `ssid`, joining it if necessary. If we're already
+    /// on that network, returns `.alreadyJoined` without touching the radio.
+    /// Otherwise applies the configuration (which also joins) and returns
+    /// `.joined` / `.failed`.
+    @discardableResult
+    func ensureJoined(ssid: String) async -> WiFiJoinOutcome {
+        if await currentSSID() == ssid {
+            log.info("Already on \(ssid, privacy: .public) — no join needed")
+            return .alreadyJoined
+        }
+        return await apply(ssid: ssid)
+    }
+
+    /// The SSID of the Wi-Fi network the phone is currently on, or nil when
+    /// not on Wi-Fi / the SSID can't be read (needs Location permission, which
+    /// the app already holds for navigation).
+    func currentSSID() async -> String? {
+        await withCheckedContinuation { cont in
+            NEHotspotNetwork.fetchCurrent { network in
+                cont.resume(returning: network?.ssid)
+            }
+        }
+    }
+
+    /// Apply (and thereby join) a Tripper hotspot configuration for `ssid`.
+    private func apply(ssid: String) async -> WiFiJoinOutcome {
+        let config = NEHotspotConfiguration(ssid: ssid,
+                                            passphrase: Self.tripperPassphrase,
+                                            isWEP: false)
+        config.joinOnce = false // persist so iOS auto-joins on later rides
+
+        return await withCheckedContinuation { cont in
+            NEHotspotConfigurationManager.shared.apply(config) { error in
+                if let error = error as NSError? {
+                    if let outcome = Self.outcome(forApplyError: error) {
+                        if case .alreadyJoined = outcome {
+                            self.log.info("Already associated with \(ssid, privacy: .public)")
+                        } else {
+                            self.log.error("Join \(ssid, privacy: .public) failed: \(error.domain, privacy: .public) \(error.code, privacy: .public) \(error.localizedDescription, privacy: .public)")
+                        }
+                        cont.resume(returning: outcome)
+                        return
+                    }
+                    // `.pending`: an earlier apply is still in flight — fall
+                    // through to the association poll instead of failing.
+                    self.log.info("Join \(ssid, privacy: .public) already pending — polling for association")
+                }
+                // `apply` succeeding only means iOS SAVED the config — it does
+                // NOT prove we actually associated (tap "Join" for an AP that
+                // isn't in range and apply still reports success). Verify the
+                // live SSID before claiming a join. Association can lag `apply`
+                // by a real margin: iOS shows the system "Join Wi-Fi?" sheet,
+                // the rider taps Join, THEN the radio associates and DHCP hands
+                // out a lease — easily 8-12s end to end on a cold join. Poll
+                // generously so a genuine (but slow) join isn't false-negatived
+                // into "saved but not associated". ~15s total: 30 tries × 500ms.
+                Task {
+                    var live: String?
+                    var joined = false
+                    for _ in 0..<30 {
+                        live = await self.currentSSID()
+                        // Accept the join when the SSID reads back as ours. When
+                        // the SSID is unreadable (nil: no precise location, or a
+                        // read right after the switch), fall back to en0 holding
+                        // a dash-subnet IPv4 (DHCP done). Never let the IPv4
+                        // check override a readable FOREIGN SSID: a home router
+                        // on 192.168.1.x would pass it instantly, report "joined"
+                        // while still on home Wi-Fi, and the connect preflight
+                        // would then abort with notOnDashNetwork.
+                        if live == ssid || (live == nil && BikeLink.wifiHasDashSubnetIPv4()) {
+                            joined = true
+                            break
+                        }
+                        try? await Task.sleep(nanoseconds: 500_000_000)
+                    }
+                    if joined {
+                        let how = live == ssid ? "SSID confirmed" : "dash-subnet IPv4 present"
+                        self.log.info("Joined \(ssid, privacy: .public) (\(how, privacy: .public))")
+                        cont.resume(returning: .joined)
+                    } else {
+                        let detail = live.map { "on \"\($0)\"" } ?? "not on Wi-Fi"
+                        self.log.error("Join \(ssid, privacy: .public) reported OK but \(detail, privacy: .public)")
+                        // iOS may refuse to leave a working network with internet
+                        // (often a store/carrier Passpoint hotspot it auto-joined)
+                        // for the dash AP, and an app can't disconnect a network it
+                        // didn't configure. A manual join in Settings always wins,
+                        // and needs no password: `apply` above already saved it.
+                        cont.resume(returning: .failed("couldn't reach \(ssid) — \(detail). Is the bike on and in range? If it is, join \"\(ssid)\" manually in Settings → Wi-Fi and retry."))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Map an `apply` error to an outcome with rider-readable text instead of
+    /// "The operation couldn't be completed. (… error 7.)". Returns nil for
+    /// `.pending` (keep polling). "Already associated" is success: iOS returns
+    /// it when the phone is already on the network.
+    /// Failure texts are lowercase fragments: the UI shows them after
+    /// "Couldn't join <bike>'s Wi-Fi: ".
+    nonisolated static func outcome(forApplyError error: NSError) -> WiFiJoinOutcome? {
+        guard error.domain == NEHotspotConfigurationErrorDomain else {
+            return .failed("error \(error.code)")
+        }
+        typealias E = NEHotspotConfigurationError
+        switch error.code {
+        case E.alreadyAssociated.rawValue: return .alreadyJoined
+        case E.pending.rawValue: return nil
+        case E.userDenied.rawValue: return .failed("the join was declined")
+        case E.invalidSSID.rawValue, E.invalidSSIDPrefix.rawValue:
+            return .failed("the Wi-Fi name looks wrong")
+        case E.invalidWPAPassphrase.rawValue: return .failed("the Wi-Fi password was rejected")
+        case E.applicationIsNotInForeground.rawValue: return .failed("open the app and try again")
+        default: return .failed("error \(error.code)")
+        }
+    }
+
+    /// Remove a Tripper network from iOS's known list (called when the rider
+    /// deletes a bike, so we don't leave orphan Wi-Fi configs behind).
+    func unregister(ssid: String) {
+        NEHotspotConfigurationManager.shared.removeConfiguration(forSSID: ssid)
+        log.info("Removed Wi-Fi configuration for \(ssid, privacy: .public)")
+    }
+}
